@@ -1,5 +1,6 @@
 """
 ฟังก์ชันช่วยเหลือสำหรับ Waste Detection App
+รองรับ YOLO, EfficientNet และโมเดลอื่นๆ
 """
 
 import glob
@@ -18,6 +19,7 @@ except ImportError as e:
 
 try:
     import torch
+    import torch.nn as nn
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -59,31 +61,203 @@ def find_model_files():
     
     return sorted(model_files)
 
+def detect_model_type(model_path):
+    """ตรวจสอบประเภทของโมเดล"""
+    try:
+        # โหลดเพื่อตรวจสอบประเภท
+        checkpoint = torch.load(model_path, map_location='cpu')
+        
+        # ตรวจสอบ metadata
+        if 'model' in checkpoint:
+            model_info = checkpoint.get('model', {})
+            if hasattr(model_info, 'yaml') or 'yaml' in str(checkpoint):
+                return 'yolo'
+            elif 'efficientnet' in str(model_info).lower():
+                return 'efficientnet'
+            elif 'mobilenet' in str(model_info).lower():
+                return 'mobilenet'
+        
+        # ตรวจสอบจากชื่อไฟล์
+        filename = os.path.basename(model_path).lower()
+        if 'yolo' in filename:
+            return 'yolo'
+        elif 'efficientnet' in filename or 'efficient' in filename:
+            return 'efficientnet'
+        elif 'mobilenet' in filename or 'mobile' in filename:
+            return 'mobilenet'
+        
+        # Default เป็น yolo
+        return 'yolo'
+        
+    except Exception as e:
+        st.warning(f"ไม่สามารถตรวจสอบประเภทโมเดลได้: {e}")
+        return 'unknown'
+
+class ModelWrapper:
+    """Wrapper class สำหรับโมเดลประเภทต่างๆ"""
+    
+    def __init__(self, model, model_type='yolo'):
+        self.model = model
+        self.model_type = model_type
+        
+    def predict(self, image, conf=0.5, iou=0.45):
+        """ทำนายผลจากรูปภาพ"""
+        try:
+            if self.model_type == 'yolo':
+                return self.model(image, conf=conf, iou=iou)
+            elif self.model_type in ['efficientnet', 'mobilenet']:
+                return self._predict_classification(image, conf)
+            else:
+                st.error(f"ไม่รองรับประเภทโมเดล: {self.model_type}")
+                return None
+        except Exception as e:
+            st.error(f"เกิดข้อผิดพลาดในการทำนาย: {e}")
+            return None
+    
+    def _predict_classification(self, image, conf=0.5):
+        """สำหรับโมเดล classification"""
+        try:
+            import torch.nn.functional as F
+            from PIL import Image
+            import torchvision.transforms as transforms
+            
+            # เตรียมรูปภาพ
+            if isinstance(image, np.ndarray):
+                image = Image.fromarray(image)
+            
+            # Transform สำหรับ EfficientNet
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+            
+            input_tensor = transform(image).unsqueeze(0)
+            
+            # Prediction
+            self.model.eval()
+            with torch.no_grad():
+                outputs = self.model(input_tensor)
+                probabilities = F.softmax(outputs, dim=1)
+                confidence, predicted = torch.max(probabilities, 1)
+                
+                # สร้าง mock result เพื่อให้เข้ากันได้กับ YOLO format
+                mock_result = MockDetectionResult(
+                    class_id=predicted.item(),
+                    confidence=confidence.item(),
+                    image_shape=image.size
+                )
+                
+                return [mock_result] if confidence.item() >= conf else []
+                
+        except Exception as e:
+            st.error(f"เกิดข้อผิดพลาดในการ classify: {e}")
+            return None
+    
+    def __call__(self, *args, **kwargs):
+        """เพื่อให้ใช้งานได้เหมือน YOLO model"""
+        return self.predict(*args, **kwargs)
+
+class MockDetectionResult:
+    """Mock class สำหรับผลลัพธ์ที่ไม่ใช่ YOLO"""
+    
+    def __init__(self, class_id, confidence, image_shape):
+        self.class_id = class_id
+        self.confidence = confidence
+        self.image_shape = image_shape
+        self.boxes = MockBoxes(class_id, confidence, image_shape)
+        self.orig_img = None
+    
+    def plot(self):
+        """Mock plot function"""
+        # ส่งคืน array เปล่าเนื่องจากไม่มี bounding box
+        return np.zeros((self.image_shape[1], self.image_shape[0], 3), dtype=np.uint8)
+
+class MockBoxes:
+    """Mock boxes สำหรับ classification results"""
+    
+    def __init__(self, class_id, confidence, image_shape):
+        self.data = [{
+            'cls': torch.tensor([class_id]),
+            'conf': torch.tensor([confidence]),
+            'xyxy': torch.tensor([[0, 0, image_shape[0], image_shape[1]]])  # Full image
+        }]
+    
+    def __len__(self):
+        return 1 if self.data else 0
+    
+    def __getitem__(self, index):
+        return MockBox(self.data[index])
+
+class MockBox:
+    """Mock individual box"""
+    
+    def __init__(self, data):
+        self.cls = data['cls']
+        self.conf = data['conf']
+        self.xyxy = data['xyxy']
+
 @st.cache_resource(show_spinner=False)
 def load_model(model_path):
-    """โหลดโมเดล YOLO"""
+    """โหลดโมเดลประเภทต่างๆ"""
     if not check_dependencies():
         return None, "❌ Dependencies ไม่ครบถ้วน"
     
     try:
+        # ตรวจสอบประเภทโมเดล
+        model_type = detect_model_type(model_path)
+        st.info(f"🔍 ตรวจพบโมเดลประเภท: {model_type}")
+        
         # ตั้งค่า torch เพื่อประหยัด memory
         if TORCH_AVAILABLE:
             torch.set_num_threads(2)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
-        if os.path.exists(model_path):
-            with st.spinner(f"กำลังโหลดโมเดล {os.path.basename(model_path)}..."):
-                # โหลดโมเดลด้วย CPU
+        if not os.path.exists(model_path):
+            return None, f"❌ ไม่พบไฟล์โมเดล: {model_path}"
+        
+        with st.spinner(f"กำลังโหลดโมเดล {os.path.basename(model_path)}..."):
+            
+            if model_type == 'yolo':
+                # โหลด YOLO model
                 model = YOLO(model_path)
                 
-                # บังคับใช้ CPU เพื่อประหยัด memory
+                # บังคับใช้ CPU
                 if hasattr(model.model, 'to'):
                     model.model.to('cpu')
                 
-                return model, f"✅ โหลดโมเดลสำเร็จ: {os.path.basename(model_path)}"
-        else:
-            return None, f"❌ ไม่พบไฟล์โมเดล: {model_path}"
+                return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดล YOLO สำเร็จ: {os.path.basename(model_path)}"
+                
+            elif model_type in ['efficientnet', 'mobilenet']:
+                # โหลด EfficientNet/MobileNet model
+                checkpoint = torch.load(model_path, map_location='cpu')
+                
+                if 'model' in checkpoint:
+                    model = checkpoint['model']
+                elif 'state_dict' in checkpoint:
+                    # สร้างโมเดลใหม่และโหลด state_dict
+                    model = create_efficientnet_model()
+                    model.load_state_dict(checkpoint['state_dict'])
+                else:
+                    model = checkpoint
+                
+                # ตั้งค่าโมเดล
+                model.eval()
+                model.to('cpu')
+                
+                return ModelWrapper(model, model_type), f"✅ โหลดโมเดล {model_type} สำเร็จ: {os.path.basename(model_path)}"
+            
+            else:
+                # ลองโหลดเป็น YOLO ก่อน
+                try:
+                    model = YOLO(model_path)
+                    if hasattr(model.model, 'to'):
+                        model.model.to('cpu')
+                    return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดลสำเร็จ (YOLO): {os.path.basename(model_path)}"
+                except:
+                    return None, f"❌ ไม่สามารถโหลดโมเดลได้: ไม่รู้จักประเภทโมเดล"
             
     except Exception as e:
         error_msg = str(e)
@@ -91,17 +265,37 @@ def load_model(model_path):
             return None, "❌ ขาด timm library - กรุณารอให้ติดตั้งเสร็จ"
         elif "lightning" in error_msg.lower():
             return None, "❌ ขาด pytorch-lightning - กรุณารอให้ติดตั้งเสร็จ"
+        elif "efficientnet" in error_msg.lower():
+            return None, f"❌ ปัญหากับ EfficientNet model: {error_msg}"
         else:
             return None, f"❌ ไม่สามารถโหลดโมเดลได้: {error_msg}"
 
+def create_efficientnet_model():
+    """สร้างโมเดล EfficientNet"""
+    try:
+        import timm
+        # ใช้ EfficientNet จาก timm
+        model = timm.create_model('efficientnet_b0', pretrained=False, num_classes=len(CLASSES))
+        return model
+    except Exception as e:
+        st.error(f"ไม่สามารถสร้าง EfficientNet model: {e}")
+        return None
+
 def process_detections(results, confidence_threshold, iou_threshold):
-    """ประมวลผลผลลัพธ์การตรวจจับ"""
+    """ประมวลผลผลลัพธ์การตรวจจับ - รองรับทั้ง YOLO และ Classification"""
     try:
         if not results or len(results) == 0:
             return None, None, None
             
-        detections = results[0].boxes
-        if detections is None or len(detections) == 0:
+        # ตรวจสอบประเภทผลลัพธ์
+        result = results[0]
+        
+        if hasattr(result, 'boxes') and result.boxes is not None:
+            detections = result.boxes
+        else:
+            return None, None, None
+        
+        if len(detections) == 0:
             return None, None, None
         
         class_counts = {}
@@ -110,17 +304,29 @@ def process_detections(results, confidence_threshold, iou_threshold):
         
         for i, detection in enumerate(detections):
             try:
-                class_id = int(detection.cls[0])
-                if class_id < len(CLASSES):
-                    class_name = CLASSES[class_id]
+                # รองรับทั้ง YOLO format และ Mock format
+                if hasattr(detection, 'cls'):
+                    class_id = int(detection.cls[0])
                     confidence = float(detection.conf[0])
                     
-                    # ตรวจสอบ confidence threshold
-                    if confidence < confidence_threshold:
-                        continue
-                    
-                    # ใช้ CPU tensor
-                    bbox = detection.xyxy[0].cpu().numpy() if hasattr(detection.xyxy[0], 'cpu') else detection.xyxy[0].numpy()
+                    if hasattr(detection.xyxy[0], 'cpu'):
+                        bbox = detection.xyxy[0].cpu().numpy()
+                    else:
+                        bbox = detection.xyxy[0].numpy()
+                        
+                elif isinstance(detection, MockBox):
+                    class_id = int(detection.cls[0])
+                    confidence = float(detection.conf[0])
+                    bbox = detection.xyxy[0].numpy()
+                else:
+                    continue
+                
+                # ตรวจสอบ confidence threshold
+                if confidence < confidence_threshold:
+                    continue
+                
+                if class_id < len(CLASSES):
+                    class_name = CLASSES[class_id]
                     
                     # ข้อมูลประเภทขยะ
                     if class_name in WASTE_CATEGORIES:
@@ -142,11 +348,11 @@ def process_detections(results, confidence_threshold, iou_threshold):
                             "วิธีจัดการ": info["recycle"],
                             "ถังขยะ": f"ถัง{info['bin_color']}",
                             "Confidence": f"{confidence:.3f}",
-                            "X1": int(bbox[0]),
-                            "Y1": int(bbox[1]), 
-                            "X2": int(bbox[2]),
-                            "Y2": int(bbox[3]),
-                            "ขนาด": f"{int(bbox[2]-bbox[0])} x {int(bbox[3]-bbox[1])}"
+                            "X1": int(bbox[0]) if len(bbox) > 0 else 0,
+                            "Y1": int(bbox[1]) if len(bbox) > 1 else 0,
+                            "X2": int(bbox[2]) if len(bbox) > 2 else 100,
+                            "Y2": int(bbox[3]) if len(bbox) > 3 else 100,
+                            "ขนาด": f"{int(bbox[2]-bbox[0])} x {int(bbox[3]-bbox[1])}" if len(bbox) >= 4 else "N/A"
                         })
                         
             except Exception as e:
