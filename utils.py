@@ -1,6 +1,7 @@
 """
 ฟังก์ชันช่วยเหลือสำหรับ Waste Detection App
-รองรับ YOLO, EfficientNet และโมเดลอื่นๆ
+รองรับ YOLO, EfficientNet, MobileNet และโมเดลอื่นๆ
+แก้ไขปัญหา PyTorch weights_only
 """
 
 import glob
@@ -20,6 +21,13 @@ except ImportError as e:
 try:
     import torch
     import torch.nn as nn
+    # เพิ่ม safe globals สำหรับ Lightning
+    if hasattr(torch.serialization, 'add_safe_globals'):
+        try:
+            import lightning.fabric.wrappers
+            torch.serialization.add_safe_globals([lightning.fabric.wrappers._FabricModule])
+        except ImportError:
+            pass
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -61,37 +69,133 @@ def find_model_files():
     
     return sorted(model_files)
 
-def detect_model_type(model_path):
-    """ตรวจสอบประเภทของโมเดล"""
+def safe_torch_load(model_path):
+    """โหลดโมเดลด้วย torch.load อย่างปลอดภัย"""
     try:
-        # โหลดเพื่อตรวจสอบประเภท
-        checkpoint = torch.load(model_path, map_location='cpu')
-        
-        # ตรวจสอบ metadata
-        if 'model' in checkpoint:
-            model_info = checkpoint.get('model', {})
-            if hasattr(model_info, 'yaml') or 'yaml' in str(checkpoint):
-                return 'yolo'
-            elif 'efficientnet' in str(model_info).lower():
-                return 'efficientnet'
-            elif 'mobilenet' in str(model_info).lower():
-                return 'mobilenet'
-        
-        # ตรวจสอบจากชื่อไฟล์
+        # วิธีที่ 1: ลองโหลดแบบ weights_only=True ก่อน
+        try:
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+            return checkpoint, 'weights_only'
+        except Exception as weights_only_error:
+            st.warning(f"ไม่สามารถโหลดแบบ weights_only=True: {weights_only_error}")
+            
+            # วิธีที่ 2: ใช้ safe_globals context
+            try:
+                # เพิ่ม safe globals สำหรับ Lightning components
+                safe_globals = []
+                try:
+                    import lightning.fabric.wrappers
+                    safe_globals.append(lightning.fabric.wrappers._FabricModule)
+                except ImportError:
+                    pass
+                
+                try:
+                    import lightning.pytorch.core.module
+                    safe_globals.append(lightning.pytorch.core.module.LightningModule)
+                except ImportError:
+                    pass
+                
+                try:
+                    import torch.nn
+                    safe_globals.extend([
+                        torch.nn.Conv2d,
+                        torch.nn.BatchNorm2d,
+                        torch.nn.ReLU,
+                        torch.nn.AdaptiveAvgPool2d,
+                        torch.nn.Linear,
+                        torch.nn.Dropout,
+                        torch.nn.Sequential,
+                        torch.nn.ModuleList,
+                        torch.nn.ModuleDict
+                    ])
+                except ImportError:
+                    pass
+                
+                if safe_globals and hasattr(torch.serialization, 'safe_globals'):
+                    with torch.serialization.safe_globals(safe_globals):
+                        checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+                        return checkpoint, 'safe_globals'
+                else:
+                    raise Exception("ไม่สามารถใช้ safe_globals ได้")
+                    
+            except Exception as safe_globals_error:
+                st.warning(f"ไม่สามารถโหลดแบบ safe_globals: {safe_globals_error}")
+                
+                # วิธีที่ 3: โหลดแบบ weights_only=False (ไม่แนะนำ แต่จำเป็น)
+                st.warning("⚠️ กำลังโหลดโมเดลแบบ weights_only=False (ไม่ปลอดภัย)")
+                checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+                return checkpoint, 'unsafe'
+                
+    except Exception as e:
+        raise Exception(f"ไม่สามารถโหลดโมเดลได้: {e}")
+
+def detect_model_type(model_path):
+    """ตรวจสอบประเภทของโมเดล - ปรับปรุงให้ปลอดภัยขึ้น"""
+    try:
+        # ตรวจสอบจากชื่อไฟล์ก่อน (เร็วกว่าและปลอดภัย)
         filename = os.path.basename(model_path).lower()
+        
         if 'yolo' in filename:
             return 'yolo'
         elif 'efficientnet' in filename or 'efficient' in filename:
             return 'efficientnet'
         elif 'mobilenet' in filename or 'mobile' in filename:
             return 'mobilenet'
+        elif 'resnet' in filename:
+            return 'resnet'
         
-        # Default เป็น yolo
-        return 'yolo'
+        # ถ้าจากชื่อไฟล์ไม่ได้ ลองเปิดไฟล์ดู
+        try:
+            checkpoint, load_method = safe_torch_load(model_path)
+            st.info(f"โหลดโมเดลด้วยวิธี: {load_method}")
+            
+            # ตรวจสอบ structure ของโมเดล
+            if isinstance(checkpoint, dict):
+                # ตรวจสอบ keys
+                keys = list(checkpoint.keys())
+                keys_str = ' '.join(keys).lower()
+                
+                if 'model' in checkpoint:
+                    model_info = str(checkpoint['model']).lower()
+                    if 'efficientnet' in model_info:
+                        return 'efficientnet'
+                    elif 'mobilenet' in model_info:
+                        return 'mobilenet'
+                    elif 'yolo' in model_info:
+                        return 'yolo'
+                
+                # ตรวจสอบจาก metadata
+                if 'yaml' in keys_str or 'anchors' in keys_str:
+                    return 'yolo'
+                elif 'efficientnet' in keys_str:
+                    return 'efficientnet'
+                elif 'mobilenet' in keys_str or 'mobile' in keys_str:
+                    return 'mobilenet'
+                
+                # ตรวจสอบจาก state_dict structure
+                if 'state_dict' in checkpoint:
+                    state_keys = list(checkpoint['state_dict'].keys())
+                    state_str = ' '.join(state_keys).lower()
+                    
+                    if 'backbone' in state_str or 'neck' in state_str or 'head' in state_str:
+                        return 'yolo'
+                    elif 'efficientnet' in state_str:
+                        return 'efficientnet'
+                    elif 'mobilenet' in state_str or 'mobile' in state_str:
+                        return 'mobilenet'
+            
+            # Default fallback
+            st.info("ไม่สามารถระบุประเภทโมเดลได้ จะลองใช้เป็น YOLO")
+            return 'yolo'
+            
+        except Exception as load_error:
+            st.warning(f"ไม่สามารถตรวจสอบโมเดลจากเนื้อหา: {load_error}")
+            # ถ้าโหลดไม่ได้ ใช้ YOLO เป็น default
+            return 'yolo'
         
     except Exception as e:
-        st.warning(f"ไม่สามารถตรวจสอบประเภทโมเดลได้: {e}")
-        return 'unknown'
+        st.warning(f"เกิดข้อผิดพลาดในการตรวจสอบประเภท: {e}")
+        return 'yolo'  # fallback เป็น YOLO
 
 class ModelWrapper:
     """Wrapper class สำหรับโมเดลประเภทต่างๆ"""
@@ -105,7 +209,7 @@ class ModelWrapper:
         try:
             if self.model_type == 'yolo':
                 return self.model(image, conf=conf, iou=iou)
-            elif self.model_type in ['efficientnet', 'mobilenet']:
+            elif self.model_type in ['efficientnet', 'mobilenet', 'resnet']:
                 return self._predict_classification(image, conf)
             else:
                 st.error(f"ไม่รองรับประเภทโมเดล: {self.model_type}")
@@ -125,7 +229,7 @@ class ModelWrapper:
             if isinstance(image, np.ndarray):
                 image = Image.fromarray(image)
             
-            # Transform สำหรับ EfficientNet
+            # Transform สำหรับ classification models
             transform = transforms.Compose([
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
@@ -143,13 +247,15 @@ class ModelWrapper:
                 confidence, predicted = torch.max(probabilities, 1)
                 
                 # สร้าง mock result เพื่อให้เข้ากันได้กับ YOLO format
-                mock_result = MockDetectionResult(
-                    class_id=predicted.item(),
-                    confidence=confidence.item(),
-                    image_shape=image.size
-                )
-                
-                return [mock_result] if confidence.item() >= conf else []
+                if confidence.item() >= conf:
+                    mock_result = MockDetectionResult(
+                        class_id=predicted.item(),
+                        confidence=confidence.item(),
+                        image_shape=image.size
+                    )
+                    return [mock_result]
+                else:
+                    return []
                 
         except Exception as e:
             st.error(f"เกิดข้อผิดพลาดในการ classify: {e}")
@@ -200,7 +306,7 @@ class MockBox:
 
 @st.cache_resource(show_spinner=False)
 def load_model(model_path):
-    """โหลดโมเดลประเภทต่างๆ"""
+    """โหลดโมเดลประเภทต่างๆ - แก้ไขปัญหา weights_only"""
     if not check_dependencies():
         return None, "❌ Dependencies ไม่ครบถ้วน"
     
@@ -222,63 +328,89 @@ def load_model(model_path):
             
             if model_type == 'yolo':
                 # โหลด YOLO model
-                model = YOLO(model_path)
-                
-                # บังคับใช้ CPU
-                if hasattr(model.model, 'to'):
-                    model.model.to('cpu')
-                
-                return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดล YOLO สำเร็จ: {os.path.basename(model_path)}"
-                
-            elif model_type in ['efficientnet', 'mobilenet']:
-                # โหลด EfficientNet/MobileNet model
-                checkpoint = torch.load(model_path, map_location='cpu')
-                
-                if 'model' in checkpoint:
-                    model = checkpoint['model']
-                elif 'state_dict' in checkpoint:
-                    # สร้างโมเดลใหม่และโหลด state_dict
-                    model = create_efficientnet_model()
-                    model.load_state_dict(checkpoint['state_dict'])
-                else:
-                    model = checkpoint
-                
-                # ตั้งค่าโมเดล
-                model.eval()
-                model.to('cpu')
-                
-                return ModelWrapper(model, model_type), f"✅ โหลดโมเดล {model_type} สำเร็จ: {os.path.basename(model_path)}"
-            
-            else:
-                # ลองโหลดเป็น YOLO ก่อน
                 try:
                     model = YOLO(model_path)
+                    
+                    # บังคับใช้ CPU
                     if hasattr(model.model, 'to'):
                         model.model.to('cpu')
-                    return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดลสำเร็จ (YOLO): {os.path.basename(model_path)}"
-                except:
-                    return None, f"❌ ไม่สามารถโหลดโมเดลได้: ไม่รู้จักประเภทโมเดล"
+                    
+                    return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดล YOLO สำเร็จ: {os.path.basename(model_path)}"
+                
+                except Exception as yolo_error:
+                    st.warning(f"ไม่สามารถโหลดเป็น YOLO: {yolo_error}")
+                    # ถ้า YOLO ไม่ได้ ลองเป็น classification
+                    model_type = 'efficientnet'
+            
+            if model_type in ['efficientnet', 'mobilenet', 'resnet']:
+                # โหลด Classification model
+                try:
+                    checkpoint, load_method = safe_torch_load(model_path)
+                    
+                    model = None
+                    
+                    if 'model' in checkpoint:
+                        model = checkpoint['model']
+                    elif 'state_dict' in checkpoint:
+                        # สร้างโมเดลใหม่และโหลด state_dict
+                        model = create_classification_model(model_type)
+                        if model:
+                            model.load_state_dict(checkpoint['state_dict'])
+                    elif isinstance(checkpoint, torch.nn.Module):
+                        model = checkpoint
+                    else:
+                        # ลองสร้างโมเดลใหม่
+                        model = create_classification_model(model_type)
+                    
+                    if model is None:
+                        raise Exception("ไม่สามารถสร้างโมเดลได้")
+                    
+                    # ตั้งค่าโมเดล
+                    model.eval()
+                    model.to('cpu')
+                    
+                    return ModelWrapper(model, model_type), f"✅ โหลดโมเดล {model_type} สำเร็จ (วิธี: {load_method}): {os.path.basename(model_path)}"
+                
+                except Exception as classification_error:
+                    st.error(f"ไม่สามารถโหลดเป็น classification model: {classification_error}")
+                    
+                    # Last resort: ลองเป็น YOLO อีกครั้ง
+                    try:
+                        model = YOLO(model_path)
+                        return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดลเป็น YOLO (fallback): {os.path.basename(model_path)}"
+                    except:
+                        return None, f"❌ ไม่สามารถโหลดโมเดลได้ในทุกรูปแบบ"
             
     except Exception as e:
         error_msg = str(e)
-        if "timm" in error_msg.lower():
-            return None, "❌ ขาด timm library - กรุณารอให้ติดตั้งเสร็จ"
+        if "weights_only" in error_msg.lower():
+            return None, f"❌ ปัญหา PyTorch weights_only: โมเดลนี้ใช้ Lightning Fabric ต้องการการโหลดแบบพิเศษ"
         elif "lightning" in error_msg.lower():
-            return None, "❌ ขาด pytorch-lightning - กรุณารอให้ติดตั้งเสร็จ"
-        elif "efficientnet" in error_msg.lower():
-            return None, f"❌ ปัญหากับ EfficientNet model: {error_msg}"
+            return None, f"❌ ปัญหา Lightning Framework: {error_msg}"
+        elif "timm" in error_msg.lower():
+            return None, "❌ ขาด timm library - กรุณารอให้ติดตั้งเสร็จ"
         else:
             return None, f"❌ ไม่สามารถโหลดโมเดลได้: {error_msg}"
 
-def create_efficientnet_model():
-    """สร้างโมเดล EfficientNet"""
+def create_classification_model(model_type):
+    """สร้างโมเดล Classification"""
     try:
-        import timm
-        # ใช้ EfficientNet จาก timm
-        model = timm.create_model('efficientnet_b0', pretrained=False, num_classes=len(CLASSES))
+        if not TIMM_AVAILABLE:
+            return None
+            
+        if model_type == 'efficientnet':
+            model = timm.create_model('efficientnet_b0', pretrained=False, num_classes=len(CLASSES))
+        elif model_type == 'mobilenet':
+            model = timm.create_model('mobilenetv3_large_100', pretrained=False, num_classes=len(CLASSES))
+        elif model_type == 'resnet':
+            model = timm.create_model('resnet50', pretrained=False, num_classes=len(CLASSES))
+        else:
+            # Default EfficientNet
+            model = timm.create_model('efficientnet_b0', pretrained=False, num_classes=len(CLASSES))
+        
         return model
     except Exception as e:
-        st.error(f"ไม่สามารถสร้าง EfficientNet model: {e}")
+        st.error(f"ไม่สามารถสร้าง {model_type} model: {e}")
         return None
 
 def process_detections(results, confidence_threshold, iou_threshold):
@@ -352,7 +484,7 @@ def process_detections(results, confidence_threshold, iou_threshold):
                             "Y1": int(bbox[1]) if len(bbox) > 1 else 0,
                             "X2": int(bbox[2]) if len(bbox) > 2 else 100,
                             "Y2": int(bbox[3]) if len(bbox) > 3 else 100,
-                            "ขนาด": f"{int(bbox[2]-bbox[0])} x {int(bbox[3]-bbox[1])}" if len(bbox) >= 4 else "N/A"
+                            "ขนาด": f"{int(bbox[2]-bbox[0])} x {int(bbox[3]-bbox[1])}" if len(bbox) >= 4 else "Full Image"
                         })
                         
             except Exception as e:
