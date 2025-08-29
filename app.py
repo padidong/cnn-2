@@ -7,29 +7,33 @@ import numpy as np
 from PIL import Image
 import pandas as pd
 
-# ตรวจสอบและ import OpenCV อย่างปลอดภัย
+# ตรวจสอบและ import dependencies อย่างปลอดภัย
 try:
     import cv2
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
-    st.error("⚠️ OpenCV ไม่พร้อมใช้งาน กรุณาติดตั้ง opencv-python-headless")
+    st.warning("⚠️ OpenCV ไม่พร้อมใช้งาน")
 
 # นำเข้าไฟล์ที่แยกไว้
-from config import (
-    CLASSES, WASTE_CATEGORIES, CSS_STYLES, HIDE_STREAMLIT_STYLE, 
-    DEFAULT_CONFIDENCE, DEFAULT_IOU, SUPPORTED_IMAGE_TYPES
-)
-from utils import (
-    find_model_files, load_model, process_detections, 
-    calculate_environmental_score, generate_recommendations, create_summary_table
-)
-from ui_components import (
-    render_header, render_waste_info_section, render_sidebar_controls,
-    render_statistics_cards, render_results_table, render_charts,
-    render_recommendations_section, render_detailed_results, 
-    render_help_section, render_footer
-)
+try:
+    from config import (
+        CLASSES, WASTE_CATEGORIES, CSS_STYLES, HIDE_STREAMLIT_STYLE, 
+        DEFAULT_CONFIDENCE, DEFAULT_IOU, SUPPORTED_IMAGE_TYPES
+    )
+    from utils import (
+        find_model_files, load_model, process_detections, 
+        calculate_environmental_score, generate_recommendations, create_summary_table
+    )
+    from ui_components import (
+        render_header, render_waste_info_section, render_sidebar_controls,
+        render_statistics_cards, render_results_table, render_charts,
+        render_recommendations_section, render_detailed_results, 
+        render_help_section, render_footer
+    )
+except ImportError as e:
+    st.error(f"❌ ไม่สามารถโหลดไฟล์ที่จำเป็นได้: {e}")
+    st.stop()
 
 def convert_image_for_processing(image):
     """แปลงรูปภาพสำหรับการประมวลผลโดยไม่ใช้ cv2"""
@@ -37,7 +41,7 @@ def convert_image_for_processing(image):
     image_array = np.array(image)
     
     # ถ้าเป็นรูป RGBA แปลงเป็น RGB
-    if image_array.shape[-1] == 4:
+    if len(image_array.shape) == 3 and image_array.shape[-1] == 4:
         image_array = image_array[:, :, :3]
     
     return image_array
@@ -50,7 +54,7 @@ def process_yolo_results(results):
             annotated_image = results[0].plot()
             annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
         else:
-            # ถ้าไม่มี cv2 ให้สร้างรูปจาก original
+            # ถ้าไม่มี cv2 ให้ใช้รูปต้นฉบับ
             annotated_image = np.array(results[0].orig_img)
             if len(annotated_image.shape) == 3 and annotated_image.shape[2] == 3:
                 # แปลง BGR เป็น RGB ถ้าจำเป็น
@@ -60,7 +64,11 @@ def process_yolo_results(results):
     except Exception as e:
         st.warning(f"ไม่สามารถแสดงรูปที่มี annotation ได้: {e}")
         # ใช้รูปต้นฉบับแทน
-        return np.array(results[0].orig_img)
+        try:
+            return np.array(results[0].orig_img)[:, :, ::-1]
+        except:
+            # หากทุกอย่างล้มเหลว ให้ส่งคืน None
+            return None
 
 def main():
     """ฟังก์ชันหลักของแอปพลิเคชัน"""
@@ -103,7 +111,10 @@ def main():
             )
     
     # โหลดโมเดล
-    model, model_status = load_model(selected_model) if selected_model else (None, "ไม่ได้เลือกโมเดล")
+    if selected_model:
+        model, model_status = load_model(selected_model)
+    else:
+        model, model_status = None, "ไม่ได้เลือกโมเดล"
     
     with st.sidebar:
         if model:
@@ -123,7 +134,11 @@ def main():
         help=f"รองรับไฟล์รูปภาพ: {', '.join([ext.upper() for ext in SUPPORTED_IMAGE_TYPES])}"
     )
     
-    if uploaded_file is not None and model is not None:
+    if uploaded_file is not None:
+        if model is None:
+            st.error("❌ กรุณาเลือกโมเดลที่ถูกต้องก่อนใช้งาน")
+            return
+            
         # แสดงรูปต้นฉบับ
         col1, col2 = st.columns(2)
         
@@ -151,7 +166,10 @@ def main():
                     
                     with col2:
                         st.markdown("### 🎯 ผลการตรวจจับ")
-                        st.image(annotated_image, caption="รูปที่ตรวจจับแล้ว", use_column_width=True)
+                        if annotated_image is not None:
+                            st.image(annotated_image, caption="รูปที่ตรวจจับแล้ว", use_column_width=True)
+                        else:
+                            st.image(image, caption="รูปต้นฉบับ (ไม่สามารถแสดง annotation ได้)", use_column_width=True)
                     
                     # ประมวลผลการตรวจจับ
                     class_counts, category_counts, detailed_data = process_detections(
@@ -193,9 +211,7 @@ def main():
                 except Exception as e:
                     st.error(f"❌ เกิดข้อผิดพลาดในการประมวลผล: {e}")
                     st.info("💡 โปรดตรวจสอบรูปแบบของรูปภาพและโมเดลที่ใช้")
-    
-    elif model is None:
-        st.error("❌ กรุณาเลือกโมเดลที่ถูกต้องก่อนใช้งาน")
+                    st.exception(e)  # แสดงรายละเอียด error เพิ่มเติม
     
     # ส่วนช่วยเหลือ
     render_help_section()
