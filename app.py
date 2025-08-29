@@ -1,8 +1,19 @@
+"""
+Waste Detection App - ระบบตรวจจับและจำแนกขยะ
+"""
+
 import streamlit as st
-import cv2
 import numpy as np
 from PIL import Image
 import pandas as pd
+
+# ตรวจสอบและ import OpenCV อย่างปลอดภัย
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    st.error("⚠️ OpenCV ไม่พร้อมใช้งาน กรุณาติดตั้ง opencv-python-headless")
 
 # นำเข้าไฟล์ที่แยกไว้
 from config import (
@@ -19,6 +30,37 @@ from ui_components import (
     render_recommendations_section, render_detailed_results, 
     render_help_section, render_footer
 )
+
+def convert_image_for_processing(image):
+    """แปลงรูปภาพสำหรับการประมวลผลโดยไม่ใช้ cv2"""
+    # แปลง PIL Image เป็น numpy array
+    image_array = np.array(image)
+    
+    # ถ้าเป็นรูป RGBA แปลงเป็น RGB
+    if image_array.shape[-1] == 4:
+        image_array = image_array[:, :, :3]
+    
+    return image_array
+
+def process_yolo_results(results):
+    """ประมวลผลผลลัพธ์ YOLO โดยไม่ใช้ cv2"""
+    try:
+        # ลองใช้ฟังก์ชัน plot แบบปกติก่อน
+        if CV2_AVAILABLE:
+            annotated_image = results[0].plot()
+            annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+        else:
+            # ถ้าไม่มี cv2 ให้สร้างรูปจาก original
+            annotated_image = np.array(results[0].orig_img)
+            if len(annotated_image.shape) == 3 and annotated_image.shape[2] == 3:
+                # แปลง BGR เป็น RGB ถ้าจำเป็น
+                annotated_image = annotated_image[:, :, ::-1]
+        
+        return annotated_image
+    except Exception as e:
+        st.warning(f"ไม่สามารถแสดงรูปที่มี annotation ได้: {e}")
+        # ใช้รูปต้นฉบับแทน
+        return np.array(results[0].orig_img)
 
 def main():
     """ฟังก์ชันหลักของแอปพลิเคชัน"""
@@ -94,8 +136,8 @@ def main():
         if st.button("🔍 เริ่มตรวจจับและจำแนกขยะ", type="primary"):
             with st.spinner("กำลังประมวลผล..."):
                 try:
-                    # แปลงรูปเป็น array
-                    image_array = np.array(image)
+                    # แปลงรูปสำหรับการประมวลผล
+                    image_array = convert_image_for_processing(image)
                     
                     # ทำการตรวจจับด้วย YOLO
                     results = model(
@@ -104,9 +146,8 @@ def main():
                         iou=controls["iou"]
                     )
                     
-                    # วาดผลลัพธ์บนรูป
-                    annotated_image = results[0].plot()
-                    annotated_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+                    # ประมวลผลรูปผลลัพธ์
+                    annotated_image = process_yolo_results(results)
                     
                     with col2:
                         st.markdown("### 🎯 ผลการตรวจจับ")
@@ -151,6 +192,7 @@ def main():
                         
                 except Exception as e:
                     st.error(f"❌ เกิดข้อผิดพลาดในการประมวลผล: {e}")
+                    st.info("💡 โปรดตรวจสอบรูปแบบของรูปภาพและโมเดลที่ใช้")
     
     elif model is None:
         st.error("❌ กรุณาเลือกโมเดลที่ถูกต้องก่อนใช้งาน")
