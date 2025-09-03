@@ -1,14 +1,18 @@
-"""
-ฟังก์ชันช่วยเหลือสำหรับ Waste Detection App
-รองรับ YOLO, EfficientNet, MobileNet และโมเดลอื่นๆ
-แก้ไขปัญหาการโหลดโมเดลทั้งหมด
-"""
-
 import glob
 import os
 import numpy as np
 import streamlit as st
 from config import MODEL_EXTENSIONS, WASTE_CATEGORIES, CLASSES
+
+# ============ เพิ่มส่วนนี้เพื่อปิด warnings ============
+import warnings
+# ปิด warning ที่เกี่ยวกับ weights_only
+warnings.filterwarnings("ignore", message=".*weights_only.*")
+# ปิด FutureWarning ทั้งหมด
+warnings.filterwarnings("ignore", category=FutureWarning)
+# ปิด UserWarning ที่เกี่ยวกับ torch.load
+warnings.filterwarnings("ignore", message=".*torch.load.*")
+# ========================================================
 
 # Import dependencies อย่างปลอดภัย
 try:
@@ -71,9 +75,12 @@ try:
     if hasattr(torch.serialization, 'add_safe_globals'):
         try:
             torch.serialization.add_safe_globals(safe_globals_list)
-            st.success(f"✅ เพิ่ม {len(safe_globals_list)} safe globals สำเร็จ")
+            # ลบข้อความ success ออก เพื่อไม่ให้รก
+            # st.success(f"✅ เพิ่ม {len(safe_globals_list)} safe globals สำเร็จ")
         except Exception as e:
-            st.warning(f"⚠️ ไม่สามารถเพิ่ม safe globals: {e}")
+            # ลบข้อความ warning ออก เพื่อไม่ให้รก
+            # st.warning(f"⚠️ ไม่สามารถเพิ่ม safe globals: {e}")
+            pass
 
 except ImportError:
     TORCH_AVAILABLE = False
@@ -123,51 +130,58 @@ def safe_torch_load(model_path):
     try:
         # วิธีที่ 1: ลองโหลดแบบ weights_only=True ก่อน
         try:
-            checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
-            return checkpoint, 'weights_only_true'
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
+                return checkpoint, 'weights_only_true'
         except Exception as weights_only_error:
-            st.warning(f"💡 ไม่สามารถโหลดแบบ weights_only=True: {str(weights_only_error)[:100]}...")
+            # ไม่แสดง warning message
+            pass
             
-            # วิธีที่ 2: ใช้ safe_globals context
-            try:
-                # สร้างรายการ safe globals ที่ครบถ้วน
-                additional_safe_globals = []
-                
-                # เพิ่ม TIMM models ที่อาจต้องใช้
-                timm_models = [
-                    'timm.models.mobilenetv3.MobileNetV3',
-                    'timm.models.efficientnet.EfficientNet', 
-                    'timm.models.resnet.ResNet',
-                    'timm.models._registry.model_entrypoint'
-                ]
-                
-                for model_name in timm_models:
-                    try:
-                        parts = model_name.split('.')
-                        module = __import__('.'.join(parts[:-1]), fromlist=[parts[-1]])
-                        cls = getattr(module, parts[-1])
-                        additional_safe_globals.append(cls)
-                    except (ImportError, AttributeError):
-                        pass
-                
-                # รวม safe globals ทั้งหมด
-                all_safe_globals = safe_globals_list + additional_safe_globals
-                
-                if all_safe_globals and hasattr(torch.serialization, 'safe_globals'):
-                    with torch.serialization.safe_globals(all_safe_globals):
+        # วิธีที่ 2: ใช้ safe_globals context
+        try:
+            # สร้างรายการ safe globals ที่ครบถ้วน
+            additional_safe_globals = []
+            
+            # เพิ่ม TIMM models ที่อาจต้องใช้
+            timm_models = [
+                'timm.models.mobilenetv3.MobileNetV3',
+                'timm.models.efficientnet.EfficientNet', 
+                'timm.models.resnet.ResNet',
+                'timm.models._registry.model_entrypoint'
+            ]
+            
+            for model_name in timm_models:
+                try:
+                    parts = model_name.split('.')
+                    module = __import__('.'.join(parts[:-1]), fromlist=[parts[-1]])
+                    cls = getattr(module, parts[-1])
+                    additional_safe_globals.append(cls)
+                except (ImportError, AttributeError):
+                    pass
+            
+            # รวม safe globals ทั้งหมด
+            all_safe_globals = safe_globals_list + additional_safe_globals
+            
+            if all_safe_globals and hasattr(torch.serialization, 'safe_globals'):
+                with torch.serialization.safe_globals(all_safe_globals):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
                         checkpoint = torch.load(model_path, map_location='cpu', weights_only=True)
                         return checkpoint, 'safe_globals'
-                else:
-                    raise Exception("ไม่สามารถใช้ safe_globals ได้")
-                    
-            except Exception as safe_globals_error:
-                st.warning(f"💡 ไม่สามารถโหลดแบบ safe_globals: {str(safe_globals_error)[:100]}...")
+            else:
+                raise Exception("ไม่สามารถใช้ safe_globals ได้")
                 
-                # วิธีที่ 3: โหลดแบบ weights_only=False (unsafe)
-                st.warning("⚠️ กำลังโหลดโมเดลแบบ weights_only=False (ไม่ปลอดภัย)")
-                checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-                return checkpoint, 'unsafe'
-                
+        except Exception as safe_globals_error:
+            # ไม่แสดง warning message
+            pass
+            
+        # วิธีที่ 3: โหลดแบบ weights_only=False (unsafe) - ปิด warning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+            return checkpoint, 'unsafe'
+            
     except Exception as e:
         raise Exception(f"ไม่สามารถโหลดโมเดลได้ในทุกวิธี: {e}")
 
@@ -190,7 +204,8 @@ def detect_model_type(model_path):
         # ถ้าจากชื่อไฟล์ไม่ได้ ลองเปิดไฟล์ดู (ระมัดระวัง)
         try:
             checkpoint, load_method = safe_torch_load(model_path)
-            st.info(f"🔍 ตรวจสอบโมเดลด้วยวิธี: {load_method}")
+            # ลบข้อความ info ออก
+            # st.info(f"🔍 ตรวจสอบโมเดลด้วยวิธี: {load_method}")
             
             # ตรวจสอบ structure ของโมเดล
             if isinstance(checkpoint, dict):
@@ -250,17 +265,23 @@ def detect_model_type(model_path):
                     return 'yolo'
             
             # Default fallback
-            st.info("ไม่สามารถระบุประเภทโมเดลจาก structure ได้ จะลองใช้เป็น EfficientNet")
+            # ลบข้อความ info ออก
+            # st.info("ไม่สามารถระบุประเภทโมเดลจาก structure ได้ จะลองใช้เป็น EfficientNet")
             return 'efficientnet'
             
         except Exception as load_error:
-            st.warning(f"ไม่สามารถตรวจสอบโมเดลจากเนื้อหา: {load_error}")
+            # ลบข้อความ warning ออก
+            # st.warning(f"ไม่สามารถตรวจสอบโมเดลจากเนื้อหา: {load_error}")
             # ถ้าโหลดไม่ได้ ใช้ EfficientNet เป็น default (เพราะส่วนใหญ่เป็น classification)
             return 'efficientnet'
         
     except Exception as e:
-        st.warning(f"เกิดข้อผิดพลาดในการตรวจสอบประเภท: {e}")
+        # ลบข้อความ warning ออก
+        # st.warning(f"เกิดข้อผิดพลาดในการตรวจสอบประเภท: {e}")
         return 'efficientnet'  # fallback เป็น EfficientNet
+
+# ============ ส่วนที่เหลือของโค้ดเหมือนเดิมทุกประการ ============
+# คลาสและฟังก์ชันที่เหลือทั้งหมดยังคงเหมือนเดิม
 
 class ModelWrapper:
     """Wrapper class สำหรับโมเดลประเภทต่างๆ"""
@@ -404,7 +425,8 @@ def extract_model_from_checkpoint(checkpoint):
         return model
         
     except Exception as e:
-        st.warning(f"ไม่สามารถแยกโมเดลจาก checkpoint: {e}")
+        # ลบข้อความ warning ออก
+        # st.warning(f"ไม่สามารถแยกโมเดลจาก checkpoint: {e}")
         return None
 
 def create_model_from_state_dict(state_dict):
@@ -440,7 +462,8 @@ def create_model_from_state_dict(state_dict):
         return model
         
     except Exception as e:
-        st.warning(f"ไม่สามารถสร้างโมเดลจาก state_dict: {e}")
+        # ลบข้อความ warning ออก
+        # st.warning(f"ไม่สามารถสร้างโมเดลจาก state_dict: {e}")
         return None
 
 @st.cache_resource(show_spinner=False)
@@ -468,7 +491,9 @@ def load_model(model_path):
             if model_type == 'yolo':
                 # โหลด YOLO model
                 try:
-                    model = YOLO(model_path)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        model = YOLO(model_path)
                     
                     # บังคับใช้ CPU
                     if hasattr(model.model, 'to'):
@@ -477,7 +502,8 @@ def load_model(model_path):
                     return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดล YOLO สำเร็จ: {os.path.basename(model_path)}"
                 
                 except Exception as yolo_error:
-                    st.warning(f"ไม่สามารถโหลดเป็น YOLO: {yolo_error}")
+                    # ลบข้อความ warning ออก
+                    # st.warning(f"ไม่สามารถโหลดเป็น YOLO: {yolo_error}")
                     # ถ้า YOLO ไม่ได้ ลองเป็น classification
                     model_type = 'efficientnet'
             
@@ -507,7 +533,9 @@ def load_model(model_path):
                     if "not iterable" in error_msg:
                         st.info("🔄 ลองโหลดเป็น YOLO แทน...")
                         try:
-                            model = YOLO(model_path)
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("ignore")
+                                model = YOLO(model_path)
                             return ModelWrapper(model, 'yolo'), f"✅ โหลดโมเดลเป็น YOLO (fallback): {os.path.basename(model_path)}"
                         except Exception as final_error:
                             return None, f"❌ ไม่สามารถโหลดในทุกรูปแบบ: {final_error}"
@@ -604,7 +632,8 @@ def process_detections(results, confidence_threshold, iou_threshold):
                         })
                         
             except Exception as e:
-                st.warning(f"ข้ามการประมวลผล detection {i}: {e}")
+                # ลบข้อความ warning ออก (ปิด warning)
+                # st.warning(f"ข้ามการประมวลผล detection {i}: {e}")
                 continue
         
         # คำนวณค่าเฉลี่ย confidence
